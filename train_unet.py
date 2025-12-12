@@ -1,31 +1,30 @@
 import os
 import time
+import csv
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
 from torch.utils.data import DataLoader
-from torchvision import datasets, transforms
+from torchvision import datasets, transforms, models
 from torchvision.utils import save_image
 from tqdm import tqdm
+from scipy import linalg
 
 # ============================================================
-# Multi-Head Self-Attention Block (Standard MHA)
+# Attention Block
 # ============================================================
 
 class AttentionBlock(nn.Module):
-    def __init__(self, channels, num_heads=4):
+    def __init__(self, channels, num_heads=2):
         super().__init__()
         self.norm = nn.GroupNorm(8, channels)
-        self.attn = nn.MultiheadAttention(
-            embed_dim=channels,
-            num_heads=num_heads,
-            batch_first=True
-        )
+        self.attn = nn.MultiheadAttention(channels, num_heads, batch_first=True)
 
     def forward(self, x):
         B, C, H, W = x.shape
-        x_norm = self.norm(x)
-        tokens = x_norm.view(B, C, H * W).permute(0, 2, 1)
+        h = self.norm(x)
+        tokens = h.view(B, C, H * W).permute(0, 2, 1)
         attn_out, _ = self.attn(tokens, tokens, tokens)
         attn_out = attn_out.permute(0, 2, 1).view(B, C, H, W)
         return x + attn_out
@@ -52,14 +51,14 @@ class ResBlock(nn.Module):
 
 
 # ============================================================
-# Stable-Diffusion-Style U-Net with MHA
+# UNet with Class Conditioning
 # ============================================================
 
 class AttentionUNet(nn.Module):
     def __init__(self, in_channels=1, base_channels=64, num_classes=10):
         super().__init__()
-
         self.class_emb = nn.Embedding(num_classes, base_channels)
+
         self.conv_in = nn.Conv2d(in_channels, base_channels, 3, padding=1)
 
         self.down1 = ResBlock(base_channels, base_channels)
@@ -81,6 +80,7 @@ class AttentionUNet(nn.Module):
 
         d1 = self.attn1(self.down1(x))
         d2 = self.attn2(self.down2(F.avg_pool2d(d1, 2)))
+
         mid = self.mid(d2)
 
         u1 = F.interpolate(mid, scale_factor=2, mode="nearest")
@@ -91,7 +91,7 @@ class AttentionUNet(nn.Module):
 
 
 # ============================================================
-# DDPM Wrapper
+# DDPM
 # ============================================================
 
 class DDPM(nn.Module):
@@ -112,14 +112,82 @@ class DDPM(nn.Module):
         B = x0.size(0)
         t = torch.randint(0, self.T, (B,), device=x0.device)
         noise = torch.randn_like(x0)
-        alpha_bar = self.alphabars[t][:, None, None, None]
-        xt = torch.sqrt(alpha_bar) * x0 + torch.sqrt(1 - alpha_bar) * noise
-        noise_pred = self.model(xt, y)
-        return F.mse_loss(noise_pred, noise)
+        a_bar = self.alphabars[t][:, None, None, None]
+        xt = torch.sqrt(a_bar) * x0 + torch.sqrt(1 - a_bar) * noise
+        pred = self.model(xt, y)
+        return F.mse_loss(pred, noise)
+
+    @torch.no_grad()
+    def sample(self, n, device):
+        x = torch.randn(n, 1, 28, 28, device=device)
+
+        # ✅ FIX: labels ALWAYS match batch size
+        y = torch.arange(n, device=device) % 10
+
+        for t in reversed(range(self.T)):
+            beta = self.betas[t]
+            alpha = self.alphas[t]
+            a_bar = self.alphabars[t]
+
+            eps = self.model(x, y)
+            z = torch.randn_like(x) if t > 0 else 0
+
+            x = (1 / torch.sqrt(alpha)) * (
+                x - (1 - alpha) / torch.sqrt(1 - a_bar) * eps
+            ) + torch.sqrt(beta) * z
+
+        return x
 
 
 # ============================================================
-# Training Loop with PROFILING
+# Batched Sampling (OOM-safe)
+# ============================================================
+
+@torch.no_grad()
+def sample_in_batches(ddpm, total, batch_size, device):
+    samples = []
+    for i in range(0, total, batch_size):
+        bs = min(batch_size, total - i)
+        samples.append(ddpm.sample(bs, device).cpu())
+        torch.cuda.empty_cache()
+    return torch.cat(samples, dim=0)
+
+
+# ============================================================
+# FID (NO torchmetrics)
+# ============================================================
+
+@torch.no_grad()
+def compute_fid(real, fake, device):
+    inception = models.inception_v3(weights="DEFAULT", transform_input=False)
+    inception.fc = nn.Identity()
+    inception.eval().to(device)
+
+    def feats(x):
+        x = x.to(device, non_blocking=True)
+        x = x.repeat(1, 3, 1, 1)
+        x = F.interpolate(x, size=299, mode="bilinear", align_corners=False)
+        f = inception(x)
+        return f.detach().cpu().numpy()
+
+    f1 = feats(real)
+    f2 = feats(fake)
+
+    mu1, mu2 = f1.mean(0), f2.mean(0)
+    s1, s2 = np.cov(f1, rowvar=False), np.cov(f2, rowvar=False)
+
+    covmean = linalg.sqrtm(s1 @ s2)
+    if np.iscomplexobj(covmean):
+        covmean = covmean.real
+
+    del inception
+    torch.cuda.empty_cache()
+
+    return float(np.sum((mu1 - mu2) ** 2) + np.trace(s1 + s2 - 2 * covmean))
+
+
+# ============================================================
+# Training
 # ============================================================
 
 def train():
@@ -127,73 +195,67 @@ def train():
 
     os.makedirs("samples", exist_ok=True)
     os.makedirs("checkpoints/unet", exist_ok=True)
+    os.makedirs("logs", exist_ok=True)
 
-    model = DDPM(AttentionUNet()).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+    model = AttentionUNet().to(device)
+    ddpm = DDPM(model).to(device)
+    opt = torch.optim.Adam(ddpm.parameters(), lr=1e-4)
 
-    dataset = datasets.MNIST(
-        "./data", train=True, download=True, transform=transforms.ToTensor()
-    )
-    loader = DataLoader(dataset, batch_size=128, shuffle=True, num_workers=0)
+    dataset = datasets.MNIST("./data", train=True, download=True, transform=transforms.ToTensor())
+    loader = DataLoader(dataset, batch_size=128, shuffle=True)
 
+    csv_path = "logs/unet_metrics.csv"
+    with open(csv_path, "w", newline="") as f:
+        csv.writer(f).writerow(
+            ["epoch", "loss", "epoch_time_s", "step_time_ms", "peak_vram_mb", "imgs_per_sec", "fid"]
+        )
+
+    best_fid = float("inf")
     epochs = 30
-    best_loss = float("inf")
-
-    print("\nEpoch | Loss | Epoch Time (s) | Step Time (ms) | Peak VRAM (MB) | imgs/s")
-    print("-" * 85)
 
     for epoch in range(epochs):
-        model.train()
-        epoch_start = time.perf_counter()
+        torch.cuda.reset_peak_memory_stats()
+        start = time.time()
 
-        if torch.cuda.is_available():
-            torch.cuda.reset_peak_memory_stats()
+        losses, step_times = [], []
+        ddpm.train()
 
-        step_times = []
-        epoch_loss = 0.0
-
-        for x, y in tqdm(loader, desc=f"Epoch {epoch}", leave=False):
+        for x, y in tqdm(loader, desc=f"Epoch {epoch}"):
+            t0 = time.time()
             x, y = x.to(device), y.to(device)
 
-            torch.cuda.synchronize() if torch.cuda.is_available() else None
-            t0 = time.perf_counter()
-
-            loss = model(x, y)
-            optimizer.zero_grad()
+            loss = ddpm(x, y)
+            opt.zero_grad()
             loss.backward()
-            optimizer.step()
+            opt.step()
 
-            torch.cuda.synchronize() if torch.cuda.is_available() else None
-            t1 = time.perf_counter()
+            losses.append(loss.item())
+            step_times.append(time.time() - t0)
 
-            step_times.append((t1 - t0) * 1000)
-            epoch_loss += loss.item()
-
-        epoch_time = time.perf_counter() - epoch_start
-        avg_step = sum(step_times) / len(step_times)
-        avg_loss = epoch_loss / len(step_times)
-
-        peak_mem = (
-            torch.cuda.max_memory_allocated() / 1024**2
-            if torch.cuda.is_available()
-            else 0.0
-        )
-
+        epoch_time = time.time() - start
         imgs_per_sec = len(dataset) / epoch_time
+        step_ms = np.mean(step_times) * 1000
+        peak_vram = torch.cuda.max_memory_allocated() / 1024**2 if device == "cuda" else 0
 
-        print(
-            f"{epoch:>5} | {avg_loss:.4f} | {epoch_time:>13.2f} | "
-            f"{avg_step:>14.2f} | {peak_mem:>14.0f} | {imgs_per_sec:>6.1f}"
-        )
+        ddpm.eval()
+        fake = sample_in_batches(ddpm, total=100, batch_size=25, device=device)
+        real = next(iter(DataLoader(dataset, batch_size=100)))[0]
 
-        if avg_loss < best_loss:
-            best_loss = avg_loss
-            torch.save(model.state_dict(), "checkpoints/ddpm_unet_best.pt")
+        fid = compute_fid(real, fake, device)
 
-        
+        save_image(fake[:100], f"samples/epoch_{epoch}.png", nrow=10, normalize=True)
 
-    print("\nTraining complete.")
+        torch.save(ddpm.state_dict(), "checkpoints/unet/last.pt")
+        if fid < best_fid:
+            best_fid = fid
+            torch.save(ddpm.state_dict(), "checkpoints/unet/best.pt")
 
+        with open(csv_path, "a", newline="") as f:
+            csv.writer(f).writerow(
+                [epoch, np.mean(losses), epoch_time, step_ms, peak_vram, imgs_per_sec, fid]
+            )
+
+        print(f"Epoch {epoch} | Loss {np.mean(losses):.4f} | FID {fid:.2f}")
 
 if __name__ == "__main__":
     train()
